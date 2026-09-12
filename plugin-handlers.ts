@@ -107,6 +107,7 @@ type TrackedRun = {
   agentId?: string;
   childSessionKey?: string;
   label: string;
+  spawnLabel?: string;
   mode?: Mode;
   requester?: SlackRequester;
   requesterSessionKey?: string;
@@ -242,16 +243,21 @@ export async function handleSpawned(
 
   cleanupStaleRuns(shared, api.logger);
 
-  const task = resolveTaskRun(api, requesterSessionKey, runId);
   const enrichedLabel =
-    asNonEmptyString(task?.label) ??
     asNonEmptyString(event.label) ??
-    asNonEmptyString(event.agentId) ??
-    asNonEmptyString(task?.title);
+    asNonEmptyString(event.agentId);
 
   const existing = shared.runs.get(runId);
   if (existing) {
-    const shouldRefresh = mergeTrackedRunMetadata(existing, event, enrichedLabel);
+    if (existing.terminalUpdateQueued) return;
+    let shouldRefresh = mergeTrackedRunMetadata(existing, event, enrichedLabel);
+    const task = await resolveTaskRun(api, requesterSessionKey, runId);
+    if (shared.runs.get(runId) !== existing || existing.terminalUpdateQueued) return;
+    shouldRefresh = mergeTrackedRunMetadata(
+      existing,
+      {},
+      asNonEmptyString(task?.label) ?? existing.spawnLabel ?? asNonEmptyString(task?.title),
+    ) || shouldRefresh;
     if (shouldRefresh) {
       await refreshRunningCardAfterMetadataMerge(api, shared, runId, existing);
     }
@@ -265,6 +271,7 @@ export async function handleSpawned(
     agentId: asNonEmptyString(event.agentId),
     childSessionKey: asNonEmptyString(event.childSessionKey ?? ctx.childSessionKey),
     label: cardTitle,
+    spawnLabel: enrichedLabel,
     mode: event.mode,
     requester: event.requester,
     requesterSessionKey,
@@ -319,7 +326,11 @@ async function initializeSpawnedRun(params: {
     return;
   }
 
-  const task = resolveTaskRun(params.api, params.requesterSessionKey, params.runId);
+  const task = await resolveTaskRun(params.api, params.requesterSessionKey, params.runId);
+  if (params.shared.runs.get(params.runId) !== params.tracked) return;
+  const taskLabel = asNonEmptyString(task?.label) ??
+    params.tracked.spawnLabel ?? asNonEmptyString(task?.title);
+  if (taskLabel) params.tracked.label = truncate(taskLabel, 80);
   const runningContent = buildRunningContent({
     task,
     runId: params.runId,
@@ -362,6 +373,7 @@ function mergeTrackedRunMetadata(
   }
 
   tracked.agentId = asNonEmptyString(event.agentId) ?? tracked.agentId;
+  tracked.spawnLabel = asNonEmptyString(event.label) ?? asNonEmptyString(event.agentId) ?? tracked.spawnLabel;
   tracked.childSessionKey = asNonEmptyString(event.childSessionKey) ?? tracked.childSessionKey;
   tracked.accountId = asNonEmptyString(event.requester?.accountId) ?? tracked.accountId;
   if (event.requester) {
@@ -389,7 +401,10 @@ async function refreshRunningCardAfterMetadataMerge(
     if (shared.runs.get(runId) !== tracked || tracked.terminalUpdateQueued) return;
     const resolved = await resolveSlackWebClient(api, shared, tracked.accountId);
     if (!resolved || shared.runs.get(runId) !== tracked || tracked.terminalUpdateQueued) return;
-    const task = resolveTaskRun(api, tracked.requesterSessionKey, runId);
+    const task = await resolveTaskRun(api, tracked.requesterSessionKey, runId);
+    if (shared.runs.get(runId) !== tracked || tracked.terminalUpdateQueued) return;
+    const taskLabel = asNonEmptyString(task?.label);
+    if (taskLabel) tracked.label = truncate(taskLabel, 80);
     await renderTrackedRunUpdate({
       web: resolved.web,
       logger: api.logger,
@@ -476,7 +491,8 @@ export async function handleAfterToolCall(
         status: event.failed ? "error" : "complete",
       });
 
-      const task = resolveTaskRun(api, tracked.requesterSessionKey, runId);
+      const task = await resolveTaskRun(api, tracked.requesterSessionKey, runId);
+      if (shared.runs.get(runId) !== tracked || tracked.terminalUpdateQueued) return;
       const runningContent = buildRunningContent({
         task,
         runId,
@@ -541,6 +557,7 @@ export async function handleEnded(
       validateTrackedRequesterSessionKey(api.logger, tracked, undefined, ctx.requesterSessionKey) ??
       tracked.requesterSessionKey;
     const task = await resolveTaskRunWithRetry(api, requesterSessionKey, runId);
+    if (shared.runs.get(runId) !== tracked) return;
     const terminalContent = buildTerminalContent({
       task,
       runId,
@@ -550,6 +567,7 @@ export async function handleEnded(
     });
 
     await enqueueRunUpdate(tracked, async () => {
+      if (shared.runs.get(runId) !== tracked) return;
       await renderTrackedRunUpdate({
         web: resolved.web,
         logger: api.logger,
@@ -720,6 +738,7 @@ function createTrackedRun(params: {
   childSessionKey?: string;
   endedAt?: number;
   label: string;
+  spawnLabel?: string;
   mode?: Mode;
   requester?: SlackRequester;
   requesterSessionKey: string;
@@ -731,6 +750,7 @@ function createTrackedRun(params: {
     startedAt: Date.now(),
     endedAt: params.endedAt,
     label: params.label,
+    spawnLabel: params.spawnLabel,
     mode: params.mode,
     requester: params.requester,
     requesterSessionKey: params.requesterSessionKey,
@@ -820,11 +840,11 @@ function reserveTrackedRun(shared: SharedState, runId: string, tracked: TrackedR
   return true;
 }
 
-function resolveTaskRun(api: PluginApi, requesterSessionKey: string | undefined, runId: string): TaskRunDetail | undefined {
+async function resolveTaskRun(api: PluginApi, requesterSessionKey: string | undefined, runId: string): Promise<TaskRunDetail | undefined> {
   if (!requesterSessionKey) return undefined;
 
   try {
-    return api.runtime.tasks.runs.bindSession({ sessionKey: requesterSessionKey }).resolve(runId);
+    return await api.runtime.tasks.async.runs.bindSession({ sessionKey: requesterSessionKey }).resolve(runId);
   } catch (error) {
     api.logger.debug?.(`slack-subagent-card: task lookup failed for runId=${runId}: ${stringifyError(error)}`);
     return undefined;
@@ -836,11 +856,11 @@ async function resolveTaskRunWithRetry(
   requesterSessionKey: string | undefined,
   runId: string,
 ): Promise<TaskRunDetail | undefined> {
-  const initial = resolveTaskRun(api, requesterSessionKey, runId);
+  const initial = await resolveTaskRun(api, requesterSessionKey, runId);
   if (hasTerminalTaskSignal(initial) || !requesterSessionKey) return initial;
 
   await sleep(TASK_LOOKUP_RETRY_MS);
-  return resolveTaskRun(api, requesterSessionKey, runId) ?? initial;
+  return (await resolveTaskRun(api, requesterSessionKey, runId)) ?? initial;
 }
 
 function validateTrackedRequesterSessionKey(

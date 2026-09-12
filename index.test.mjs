@@ -200,10 +200,12 @@ function createHarness(options = {}) {
     },
     runtime: {
       tasks: {
-        runs: {
-          bindSession({ sessionKey }) {
-            assert.equal(sessionKey, options.sessionKey ?? THREAD_SESSION_KEY);
-            return { resolve: () => currentTask };
+        async: {
+          runs: {
+            bindSession({ sessionKey }) {
+              assert.equal(sessionKey, options.sessionKey ?? THREAD_SESSION_KEY);
+              return { resolve: async () => options.onResolve ? options.onResolve() : currentTask };
+            },
           },
         },
       },
@@ -260,6 +262,80 @@ describe("portable lifecycle convergence", () => {
     assert.equal(plan(harness.web.posts[0]).type, "plan");
     assert.equal(mainTask(harness.web.posts[0]).status, "in_progress");
     assert.equal(harness.shared.runs.size, 1);
+  });
+
+  for (const source of ["label", "agentId", "title"]) {
+    it(`uses the ${source} source even when a spawn label equals the run ID`, async () => {
+      const runId = "run-label-source";
+      const harness = createHarness({ task: createTaskRunDetail({ label: undefined, title: "Task title" }) });
+      await handleSpawned(
+        harness.api,
+        harness.shared,
+        createSpawnedEvent(runId, { label: undefined, agentId: undefined, ...(source === "title" ? {} : { [source]: runId }) }),
+        createHookContext(runId),
+      );
+
+      assert.equal(mainTask(harness.web.posts[0]).title, source === "title" ? "Task title" : runId);
+    });
+  }
+
+  it("retains a duplicate spawn label received while the initial task lookup is pending", async () => {
+    const runId = "run-pending-label";
+    const gate = deferred();
+    const task = createTaskRunDetail({ label: undefined, title: "Task title" });
+    let lookups = 0;
+    const harness = createHarness({ onResolve: () => ++lookups === 1 ? gate.promise : task });
+    const initial = handleSpawned(
+      harness.api,
+      harness.shared,
+      createSpawnedEvent(runId, { label: undefined, agentId: undefined }),
+      createHookContext(runId),
+    );
+    await waitFor(() => lookups === 1, "initial task lookup");
+    const duplicate = handleSpawned(
+      harness.api,
+      harness.shared,
+      createSpawnedEvent(runId, { label: runId, agentId: undefined }),
+      createHookContext(runId),
+    );
+    await waitFor(() => lookups === 2, "duplicate task lookup");
+    gate.resolve(task);
+    await Promise.all([initial, duplicate]);
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(mainTask(harness.web.posts[0]).title, runId);
+  });
+
+  it("retains a rich spawn label when a sparse started hook follows", async () => {
+    const harness = createHarness({ task: createTaskRunDetail({ label: undefined, title: "Task title" }) });
+    const runId = await spawn(harness, { label: "Explicit spawn label" });
+
+    await handleProgress(harness.api, harness.shared, createProgressEvent("started", runId), createHookContext(runId));
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(mainTask(harness.web.posts[0]).title, "Explicit spawn label");
+  });
+
+  it("applies duplicate spawn metadata before a pending lookup can be overtaken by termination", async () => {
+    const gate = deferred();
+    let lookups = 0;
+    const task = createTaskRunDetail({ label: undefined, title: undefined, status: "succeeded" });
+    const harness = createHarness({ onResolve: () => ++lookups === 2 ? gate.promise : task });
+    const runId = await spawn(harness);
+    const duplicate = handleSpawned(
+      harness.api,
+      harness.shared,
+      createSpawnedEvent(runId, { label: "Updated before termination" }),
+      createHookContext(runId),
+    );
+    await waitFor(() => lookups === 2, "duplicate task lookup");
+
+    await handleEnded(harness.api, harness.shared, createEndedEvent(runId), createHookContext(runId));
+    assert.equal(mainTask(harness.web.updates[0]).title, "Updated before termination");
+    gate.resolve(task);
+    await duplicate;
+    assert.equal(harness.web.updates.length, 1);
   });
 
   it("finalizes a retained run from subagent_progress ended", async () => {
@@ -417,6 +493,18 @@ describe("portable lifecycle convergence", () => {
     );
   });
 
+  it("refreshes the task label when an otherwise identical spawn event is repeated", async () => {
+    const harness = createHarness();
+    const runId = await spawn(harness);
+    harness.setTask(createTaskRunDetail({ label: "Resolved task label" }));
+
+    await spawn(harness, { runId });
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(mainTask(harness.web.updates[0]).title, "Resolved task label");
+  });
+
   it("reserves synchronously and returns from the hook while Slack is blocked", async () => {
     const gate = deferred();
     const web = createFakeWeb({ onPost: () => gate.promise });
@@ -457,6 +545,34 @@ describe("portable lifecycle convergence", () => {
 
     await waitFor(() => web.updates.length === 1 && !harness.shared.runs.has("run-race"), "terminal update");
     assert.equal(web.updates.length, 1);
+  });
+
+  it("preserves a terminal signal while the initial task lookup is pending", async () => {
+    const gate = deferred();
+    let lookupStarted = false;
+    const harness = createHarness({ onResolve: () => {
+      lookupStarted = true;
+      return gate.promise;
+    } });
+    const registrations = new Map();
+    harness.api.on = (name, handler) => registrations.set(name, handler);
+    registerSlackSubagentCardHandlers(harness.api, harness.shared);
+
+    registrations.get("subagent_spawned")(
+      createSpawnedEvent("run-lookup", { label: "Lookup" }),
+      createHookContext("run-lookup"),
+    );
+    assert.equal(harness.shared.runs.has("run-lookup"), true);
+    await waitFor(() => lookupStarted, "initial task lookup");
+    registrations.get("subagent_progress")(
+      createProgressEvent("ended", "run-lookup"),
+      createHookContext("run-lookup"),
+    );
+    gate.resolve({ status: "succeeded", terminalSummary: "Finished" });
+
+    await waitFor(() => harness.web.updates.length === 1 && !harness.shared.runs.has("run-lookup"), "terminal update after lookup");
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(mainTask(harness.web.updates[0]).status, "complete");
   });
 
   it("cleans up when secret resolution rejects after the terminal claim", async () => {
