@@ -332,7 +332,7 @@ describe("portable lifecycle convergence", () => {
     await waitFor(() => lookups === 2, "duplicate task lookup");
 
     await handleEnded(harness.api, harness.shared, createEndedEvent(runId), createHookContext(runId));
-    assert.equal(mainTask(harness.web.updates[0]).title, "Updated before termination");
+    assert.equal(mainTask(harness.web.updates[0]).title, "Updated before termination (just now)");
     gate.resolve(task);
     await duplicate;
     assert.equal(harness.web.updates.length, 1);
