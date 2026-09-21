@@ -12,7 +12,7 @@ The implementation uses Block Kit message posts and updates only; it does not us
 - OpenClaw `>=2026.7.2-beta.3`
 - A Slack bot token in OpenClaw configuration, or `SLACK_BOT_TOKEN` for the effective default account
 
-This OpenClaw floor is intentional. The plugin imports supported focused SDK entry points and uses the portable `subagent_progress` hook introduced by the pinned beta.
+This OpenClaw floor is intentional. The plugin imports supported focused SDK entry points and uses the portable `subagent_progress` hook introduced by the pinned beta. Task metadata reads use the asynchronous task API when the host provides it, with synchronous reads on older supported hosts.
 
 ## Configuration
 

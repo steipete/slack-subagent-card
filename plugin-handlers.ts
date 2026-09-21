@@ -844,7 +844,18 @@ async function resolveTaskRun(api: PluginApi, requesterSessionKey: string | unde
   if (!requesterSessionKey) return undefined;
 
   try {
-    return await api.runtime.tasks.async.runs.bindSession({ sessionKey: requesterSessionKey }).resolve(runId);
+    const tasks: PluginApi["runtime"]["tasks"] & {
+      async?: {
+        runs: {
+          bindSession(params: { sessionKey: string }): {
+            resolve(runId: string): Promise<TaskRunDetail | undefined>;
+          };
+        };
+      };
+    } = api.runtime.tasks;
+    // Older supported hosts expose only the synchronous task-read namespace.
+    const runs = tasks.async === undefined ? tasks.runs : tasks.async.runs;
+    return await runs.bindSession({ sessionKey: requesterSessionKey }).resolve(runId);
   } catch (error) {
     api.logger.debug?.(`slack-subagent-card: task lookup failed for runId=${runId}: ${stringifyError(error)}`);
     return undefined;

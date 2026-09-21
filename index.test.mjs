@@ -279,6 +279,43 @@ describe("portable lifecycle convergence", () => {
     });
   }
 
+  for (const readMode of ["legacy", "async", "missing", "rejected"]) {
+    it(`uses ${readMode} task reads without retrying an available async namespace synchronously`, async () => {
+      const runId = "run-host-task-reads";
+      const task = createTaskRunDetail({ label: "Task metadata label" });
+      let asyncReads = 0;
+      let legacyReads = 0;
+      const harness = createHarness({
+        onResolve: () => {
+          asyncReads += 1;
+          if (readMode === "rejected") throw new Error("task read unavailable");
+          return readMode === "missing" ? undefined : task;
+        },
+      });
+      harness.api.runtime.tasks.runs = {
+        bindSession({ sessionKey }) {
+          assert.equal(sessionKey, THREAD_SESSION_KEY);
+          return {
+            resolve(id) {
+              assert.equal(id, runId);
+              legacyReads += 1;
+              return task;
+            },
+          };
+        },
+      };
+      if (readMode === "legacy") delete harness.api.runtime.tasks.async;
+
+      await spawn(harness, { runId, label: "Event label" });
+
+      assert.equal(harness.web.posts.length, 1);
+      assert.equal(mainTask(harness.web.posts[0]).title,
+        readMode === "legacy" || readMode === "async" ? "Task metadata label" : "Event label");
+      assert.equal(legacyReads, readMode === "legacy" ? 1 : 0);
+      assert.equal(asyncReads, readMode === "legacy" ? 0 : 1);
+    });
+  }
+
   it("retains a duplicate spawn label received while the initial task lookup is pending", async () => {
     const runId = "run-pending-label";
     const gate = deferred();
